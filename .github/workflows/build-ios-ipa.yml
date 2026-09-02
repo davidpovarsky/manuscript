@@ -1,0 +1,103 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios:
+    name: Build unsigned Manuscript IPA
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26.2
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.2.app/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Allow Swift macros in CI
+        run: |
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation -bool YES
+
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project Manuscript/Manuscript.xcodeproj \
+            -scheme manuscript \
+            -skipMacroValidation \
+            -skipPackagePluginValidation
+
+      - name: Build iOS app without code signing
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Manuscript/Manuscript.xcodeproj \
+            -scheme manuscript \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/ManuscriptDerivedData" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            DEVELOPMENT_TEAM='' \
+            build | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$RUNNER_TEMP/ManuscriptDerivedData/Build/Products/Release-iphoneos/Manuscript.app"
+          if [[ ! -d "$APP_PATH" ]]; then
+            echo "Expected app bundle not found at: $APP_PATH"
+            echo "Available app bundles:"
+            find "$RUNNER_TEMP/ManuscriptDerivedData/Build/Products" -maxdepth 3 -name '*.app' -print || true
+            exit 1
+          fi
+
+          PACKAGE_DIR="$RUNNER_TEMP/ManuscriptIPA"
+          mkdir -p "$PACKAGE_DIR/Payload"
+          cp -R "$APP_PATH" "$PACKAGE_DIR/Payload/"
+
+          cd "$PACKAGE_DIR"
+          /usr/bin/zip -qry "$GITHUB_WORKSPACE/Manuscript.ipa" Payload
+
+          echo "Created IPA:"
+          ls -lh "$GITHUB_WORKSPACE/Manuscript.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Manuscript-unsigned-ipa
+          path: Manuscript.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Manuscript-xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
