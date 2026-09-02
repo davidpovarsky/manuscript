@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   build-ios:
-    name: Build unsigned Manuscript IPA
+    name: Build local-only unsigned Manuscript IPA
     runs-on: macos-26
     timeout-minutes: 45
 
@@ -33,6 +33,44 @@ jobs:
         run: |
           defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
           defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation -bool YES
+
+      - name: Prepare local-only sideload sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("Manuscript/Manuscript/ManuscriptApp.swift")
+          source = path.read_text()
+          old = '''    init() {
+              // Debug: Print iCloud status on launch
+              printICloudDebugInfo()
+          }
+          '''
+          new = '''    init() {
+              // The sideload build is intentionally local-only. Avoid touching
+              // iCloud ubiquity APIs during application launch.
+          }
+          '''
+
+          if old not in source:
+              raise SystemExit("Could not find the expected iCloud launch probe in ManuscriptApp.swift")
+
+          path.write_text(source.replace(old, new, 1))
+          PY
+
+          # The sideload artifact must not request an app-specific iCloud container.
+          /usr/libexec/PlistBuddy \
+            -c 'Delete :CFBundleDocumentTypes:0:NSUbiquitousDocumentUserActivityType' \
+            Manuscript/Manuscript/Info.plist || true
+
+          /usr/libexec/PlistBuddy \
+            -c 'Delete :com.apple.developer.icloud-services' \
+            Manuscript/Manuscript/Manuscript.entitlements || true
+
+          echo "Local-only sideload source preparation complete."
 
       - name: Resolve Swift packages
         run: |
@@ -59,8 +97,47 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY='' \
+            CODE_SIGN_ENTITLEMENTS='' \
             DEVELOPMENT_TEAM='' \
+            REGISTER_APP_GROUPS=NO \
+            PRODUCT_BUNDLE_IDENTIFIER=com.davidpovarsky.manuscript.sideload \
             build | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Verify local-only app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$RUNNER_TEMP/ManuscriptDerivedData/Build/Products/Release-iphoneos/Manuscript.app"
+          INFO_PLIST="$APP_PATH/Info.plist"
+
+          if [[ ! -d "$APP_PATH" ]]; then
+            echo "Expected app bundle not found at: $APP_PATH"
+            exit 1
+          fi
+
+          if [[ -d "$APP_PATH/_CodeSignature" ]]; then
+            echo "Unexpected code signature found in unsigned app bundle."
+            exit 1
+          fi
+
+          if [[ -f "$APP_PATH/embedded.mobileprovision" ]]; then
+            echo "Unexpected provisioning profile found in unsigned app bundle."
+            exit 1
+          fi
+
+          if /usr/libexec/PlistBuddy -c 'Print :CFBundleDocumentTypes:0:NSUbiquitousDocumentUserActivityType' "$INFO_PLIST" >/dev/null 2>&1; then
+            echo "Unexpected iCloud document activity declaration remains in Info.plist."
+            exit 1
+          fi
+
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST")
+          if [[ "$BUNDLE_ID" != "com.davidpovarsky.manuscript.sideload" ]]; then
+            echo "Unexpected bundle identifier: $BUNDLE_ID"
+            exit 1
+          fi
+
+          echo "Verified local-only unsigned app bundle: $BUNDLE_ID"
 
       - name: Package unsigned IPA
         shell: bash
@@ -68,28 +145,23 @@ jobs:
           set -euo pipefail
 
           APP_PATH="$RUNNER_TEMP/ManuscriptDerivedData/Build/Products/Release-iphoneos/Manuscript.app"
-          if [[ ! -d "$APP_PATH" ]]; then
-            echo "Expected app bundle not found at: $APP_PATH"
-            echo "Available app bundles:"
-            find "$RUNNER_TEMP/ManuscriptDerivedData/Build/Products" -maxdepth 3 -name '*.app' -print || true
-            exit 1
-          fi
-
           PACKAGE_DIR="$RUNNER_TEMP/ManuscriptIPA"
+
+          rm -rf "$PACKAGE_DIR"
           mkdir -p "$PACKAGE_DIR/Payload"
           cp -R "$APP_PATH" "$PACKAGE_DIR/Payload/"
 
           cd "$PACKAGE_DIR"
-          /usr/bin/zip -qry "$GITHUB_WORKSPACE/Manuscript.ipa" Payload
+          /usr/bin/zip -qry "$GITHUB_WORKSPACE/Manuscript-local-sideload.ipa" Payload
 
-          echo "Created IPA:"
-          ls -lh "$GITHUB_WORKSPACE/Manuscript.ipa"
+          echo "Created local-only sideload IPA:"
+          ls -lh "$GITHUB_WORKSPACE/Manuscript-local-sideload.ipa"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Manuscript-unsigned-ipa
-          path: Manuscript.ipa
+          name: Manuscript-local-sideload-unsigned-ipa
+          path: Manuscript-local-sideload.ipa
           if-no-files-found: error
           retention-days: 14
 
