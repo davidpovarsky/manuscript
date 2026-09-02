@@ -41,27 +41,23 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("Manuscript/Manuscript/ManuscriptApp.swift")
           source = path.read_text()
-          old = '''    init() {
-              // Debug: Print iCloud status on launch
-              printICloudDebugInfo()
-          }
-          '''
-          new = '''    init() {
-              // The sideload build is intentionally local-only. Avoid touching
-              // iCloud ubiquity APIs during application launch.
-          }
-          '''
 
-          if old not in source:
-              raise SystemExit("Could not find the expected iCloud launch probe in ManuscriptApp.swift")
+          pattern = r'(?m)^(\s*)printICloudDebugInfo\(\)\s*$'
+          replacement = r'\1// iCloud launch probe disabled for local-only sideload build.'
+          source, count = re.subn(pattern, replacement, source, count=1)
 
-          path.write_text(source.replace(old, new, 1))
+          if count != 1:
+              raise SystemExit("Could not find printICloudDebugInfo() in ManuscriptApp.swift")
+
+          path.write_text(source)
           PY
 
-          # The sideload artifact must not request an app-specific iCloud container.
+          # The sideload artifact must not request iCloud capabilities tied to
+          # the upstream developer's signing identity.
           /usr/libexec/PlistBuddy \
             -c 'Delete :CFBundleDocumentTypes:0:NSUbiquitousDocumentUserActivityType' \
             Manuscript/Manuscript/Info.plist || true
